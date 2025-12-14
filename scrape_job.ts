@@ -14,13 +14,13 @@ async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
   let page = 1;
   let hasNewData = true;
 
-  const citySlug = city.trim().toLowerCase().replace(/\s+/g, "-");
+  const cityNorm = city.trim().toLowerCase().replace(/\s+/g, "-");
 
   while (hasNewData) {
-    console.log(`Scraping ${city} — page ${page}...`);
+    console.log(`page ${page}...`);
 
     const { data: html } = await axios.get(
-      `${BASE_URL}/${citySlug}/all?page=${page}`,
+      `${BASE_URL}/${cityNorm}/all?page=${page}`,
       {
         headers: {
           "User-Agent":
@@ -39,7 +39,7 @@ async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
       if (title && href && !title.toLowerCase().startsWith("all jobs in")) {
         jobsOnPage.push({
           title,
-          url: SITE_URL + href, // absolute URL
+          url: SITE_URL + href, 
         });
       }
     });
@@ -54,7 +54,6 @@ async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
   return Array.from(uniqueJobs.values());
 }
 
-// Example usage
 scrapeAllJobTitles("Whangarei").then((jobs) => {
   console.log("Jobs:", jobs);
 });
