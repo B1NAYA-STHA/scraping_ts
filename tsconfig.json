@@ -8,15 +8,14 @@
     // Environment Settings
     // See also https://aka.ms/tsconfig/module
     "types": [],
-    "target": "ES2022",         // Use a modern JavaScript target
-    "module": "NodeNext",       // <-- Tells TS to use Node's modern module resolution
-    "moduleResolution": "NodeNext", // <-- Crucial for resolving package paths (e.g., in node_modules)
+    "target": "es2022",         // Use a modern JavaScript target
+    "module": "esnext",       // <-- Tells TS to use Node's modern module resolution
+    "moduleResolution": "bundler",// <-- Crucial for resolving package paths (e.g., in node_modules)
     "esModuleInterop": true,
     // For nodejs:
     // "lib": ["esnext"],
     // "types": ["node"],
     // and npm install -D @types/node
-
     // Other Outputs
     "sourceMap": true,
     "declaration": true,
