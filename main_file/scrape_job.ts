@@ -2,83 +2,137 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import fs from "fs";
 
-// Required URLs
-const BASE_URL = "https://www.zeil.com/jobs"; 
-const SITE_URL = "https://www.zeil.com";      
+// CONFIG
+const BASE_URL = "https://www.zeil.com/jobs";
+const SITE_URL = "https://www.zeil.com";
+const CONCURRENCY_LIMIT = 5; // number of pages fetched concurrently
 
+// Interface for job links
 interface JobLink {
-  title: string;
-  url: string;
+  id: string;      // Unique job ID extracted from URL
+  title: string;   // Job title
+  url: string;     // Full job URL
 }
 
-async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
-  const uniqueJobs = new Map<string, JobLink>(); // Store unique jobs using URL as key
-  let page = 1;                               
-  let hasNewData = true;                        
+// Fetch single page 
+async function fetchPage(cityNorm: string, page: number): Promise<JobLink[]> {
+  console.log(`Fetching page ${page}...`);
 
-  // Normalize city name for URL
-  const cityNorm = city.trim().toLowerCase().replace(/\s+/g, "-"); 
-  
-  while (hasNewData) {
-    console.log(`Scraping page ${page}...`);
-
-    // Fetch HTML of the current page
-    const { data: html } = await axios.get(
-      `${BASE_URL}/${cityNorm}/all?page=${page}`,
-      {
-        // Avoid blocking by server
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", 
-          Accept: "text/html,application/xhtml+xml",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      }
-    );
-
-    // Load HTML into cheerio
-    const $ = cheerio.load(html); 
-    const jobsOnPage: JobLink[] = [];
-
-    // Extract job title and URL
-    $(".title.v2 a").each((_, el) => {
-      const title = $(el).text().trim();
-      const href = $(el).attr("href");
-
-      // Filter out irrelevant links like "All jobs in ..."
-      if (title && href && !title.toLowerCase().startsWith("all jobs in")) {
-        jobsOnPage.push({
-          title,
-          url: SITE_URL + href,
-        });
-      }
-    });
-
-    // Check if new jobs were added
-    const beforeSize = uniqueJobs.size;
-    jobsOnPage.forEach((job) => uniqueJobs.set(job.url, job));
-    hasNewData = uniqueJobs.size > beforeSize; 
-
-    page++; // Move to next page
-  }
-
-  // Return unique jobs as an array
-  return Array.from(uniqueJobs.values()); 
-}
-
-// Save jobs to JSON file
-async function run() {
-  const jobs = await scrapeAllJobTitles("Whangarei");
-
-  fs.writeFileSync("jobs.json", 
-    JSON.stringify({
-      city: "Whangarei",
-      total: jobs.length,
-      jobs,
-    }, null, 2), 
-    "utf-8"
+  const { data: html } = await axios.get(
+    `${BASE_URL}/${cityNorm}/all?page=${page}`,
+    {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    }
   );
 
-  console.log(`Saved ${jobs.length} jobs to jobs.json`);
+  const $ = cheerio.load(html);
+  const jobs: JobLink[] = [];
+
+  $(".title.tile.v2 a").each((_, el) => {
+    const title = $(el).text().trim();
+    const href = $(el).attr("href");
+
+    if (title && href) {
+      // Extract job ID from URL
+      const idMatch = href.match(/\/job\/([^?\/]+)/);
+      const id = idMatch ? idMatch[1] : " ";
+
+      jobs.push({
+        id,       // Add extracted ID
+        title,
+        url: SITE_URL + href,
+      });
+    }
+  });
+
+  console.log(`Page ${page} → ${jobs.length} jobs`);
+  return jobs;
+}
+
+// Async pool helper 
+async function asyncPool<T, R>(
+  poolLimit: number,
+  tasks: (() => Promise<R>)[]
+): Promise<R[]> {
+  const results: R[] = [];
+  const executing: Promise<void>[] = [];
+
+  for (const task of tasks) {
+    const p = task()
+      .then((r) => {
+        results.push(r);
+      })
+      .catch(() => {});
+    executing.push(p);
+
+    if (executing.length >= poolLimit) {
+      await Promise.race(executing);
+
+      // Remove completed promises
+      const settled = await Promise.allSettled(executing);
+      for (let i = executing.length - 1; i >= 0; i--) {
+        if (settled[i]?.status === "fulfilled") executing.splice(i, 1);
+      }
+    }
+  }
+
+  await Promise.all(executing);
+  return results;
+}
+
+// Scrape all job titles 
+async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
+  const jobs: JobLink[] = [];
+  const cityNorm = city.trim().toLowerCase().replace(/\s+/g, "-");
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    // Prepare batch of tasks with concurrency
+    const tasks: (() => Promise<JobLink[]>)[] = [];
+    for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
+      const currentPage = page + i;
+      tasks.push(async () => {
+        const pageJobs = await fetchPage(cityNorm, currentPage);
+        if (pageJobs.length === 0) hasMore = false; // stop if no jobs
+        return pageJobs;
+      });
+    }
+
+    // Run batch concurrently
+    const batchResults = await Promise.all(tasks.map((t) => t()));
+
+    // Flatten results
+    for (const pageJobs of batchResults) {
+      jobs.push(...pageJobs);
+    }
+
+    page += CONCURRENCY_LIMIT;
+  }
+
+  return jobs;
+}
+
+// main function
+async function run() {
+  const city = "whangarei";
+  console.log(`\nScraping jobs`);
+
+  const jobs = await scrapeAllJobTitles(city);
+
+  const output = {
+    city,
+    total: jobs.length,
+    jobs,
+  };
+
+  // Save to JSON
+  fs.writeFileSync("whangarei_jobs.json", JSON.stringify(output, null, 2), "utf-8");
+  console.log(`\nSaved ${jobs.length} jobs to whangarei_jobs.json`);
 }
 
 run();
