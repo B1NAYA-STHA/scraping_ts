@@ -9,43 +9,37 @@ const CONCURRENCY_LIMIT = 5; // number of pages fetched concurrently
 
 // Interface for job links
 interface JobLink {
-  id: string;      // Unique job ID extracted from URL
-  title: string;   // Job title
-  url: string;     // Full job URL
+  id: string;      
+  title: string;  
+  url: string;    
 }
 
-// Fetch single page 
+// headers
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+  Accept: "text/html,application/xhtml+xml",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+// Fetch a single page of jobs
 async function fetchPage(cityNorm: string, page: number): Promise<JobLink[]> {
   console.log(`Fetching page ${page}...`);
 
-  const { data: html } = await axios.get(
-    `${BASE_URL}/${cityNorm}/all?page=${page}`,
-    {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    }
-  );
-
+  const { data: html } = await axios.get(`${BASE_URL}/${cityNorm}/all?page=${page}`, { headers: HEADERS });
   const $ = cheerio.load(html);
-  const jobs: JobLink[] = [];
 
+  const jobs: JobLink[] = [];
   $(".title.tile.v2 a").each((_, el) => {
     const title = $(el).text().trim();
     const href = $(el).attr("href");
 
-    if (title && href) {
-      // Extract job ID from URL
+    if (title && href && typeof href === "string") {
       const idMatch = href.match(/\/job\/([^?\/]+)/);
-      const id = idMatch ? idMatch[1] : " ";
+      const id = idMatch ? idMatch[1] : "";
 
-      jobs.push({
-        id,       // Add extracted ID
-        title,
-        url: SITE_URL + href,
-      });
+      if (id) {
+        jobs.push({ id, title: title, url: SITE_URL + href });
+      }
     }
   });
 
@@ -53,29 +47,25 @@ async function fetchPage(cityNorm: string, page: number): Promise<JobLink[]> {
   return jobs;
 }
 
-// Async pool helper 
-async function asyncPool<T, R>(
+// Async pool for concurrency
+async function asyncPool<T>(
   poolLimit: number,
-  tasks: (() => Promise<R>)[]
-): Promise<R[]> {
-  const results: R[] = [];
+  tasks: (() => Promise<T>)[]
+): Promise<T[]> {
+  const results: T[] = [];
   const executing: Promise<void>[] = [];
 
   for (const task of tasks) {
     const p = task()
-      .then((r) => {
-        results.push(r);
-      })
+      .then((res) => results.push(res))
       .catch(() => {});
     executing.push(p);
 
     if (executing.length >= poolLimit) {
       await Promise.race(executing);
-
-      // Remove completed promises
-      const settled = await Promise.allSettled(executing);
+      // Remove fulfilled promises
       for (let i = executing.length - 1; i >= 0; i--) {
-        if (settled[i]?.status === "fulfilled") executing.splice(i, 1);
+        if ((executing[i] as any).settled) executing.splice(i, 1);
       }
     }
   }
@@ -84,33 +74,31 @@ async function asyncPool<T, R>(
   return results;
 }
 
-// Scrape all job titles 
+// Scrape all job titles for a city
 async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
-  const jobs: JobLink[] = [];
   const cityNorm = city.trim().toLowerCase().replace(/\s+/g, "-");
+  const jobs: JobLink[] = [];
+
   let page = 1;
   let hasMore = true;
 
   while (hasMore) {
-    // Prepare batch of tasks with concurrency
-    const tasks: (() => Promise<JobLink[]>)[] = [];
-    for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
+    // Prepare concurrent page fetches
+    const tasks = Array.from({ length: CONCURRENCY_LIMIT }, (_, i) => {
       const currentPage = page + i;
-      tasks.push(async () => {
-        const pageJobs = await fetchPage(cityNorm, currentPage);
-        if (pageJobs.length === 0) hasMore = false; // stop if no jobs
-        return pageJobs;
-      });
-    }
+      return async () => await fetchPage(cityNorm, currentPage);
+    });
 
-    // Run batch concurrently
     const batchResults = await Promise.all(tasks.map((t) => t()));
 
-    // Flatten results
+    // Flatten results and check if last page reached
+    let emptyPageCount = 0;
     for (const pageJobs of batchResults) {
+      if (pageJobs.length === 0) emptyPageCount++;
       jobs.push(...pageJobs);
     }
 
+    if (emptyPageCount === CONCURRENCY_LIMIT) hasMore = false;
     page += CONCURRENCY_LIMIT;
   }
 
@@ -118,21 +106,18 @@ async function scrapeAllJobTitles(city: string): Promise<JobLink[]> {
 }
 
 // main function
-async function run() {
-  const city = "whangarei";
-  console.log(`\nScraping jobs`);
+(async function run() {
+  try {
+    const city = "Hamilton";
+    console.log(`\nScraping jobs for ${city}...`);
 
-  const jobs = await scrapeAllJobTitles(city);
+    const jobs = await scrapeAllJobTitles(city);
 
-  const output = {
-    city,
-    total: jobs.length,
-    jobs,
-  };
+    const output = { city, total: jobs.length, jobs };
+    fs.writeFileSync(`${city}_jobs.json`, JSON.stringify(output, null, 2), "utf-8");
 
-  // Save to JSON
-  fs.writeFileSync("whangarei_jobs.json", JSON.stringify(output, null, 2), "utf-8");
-  console.log(`\nSaved ${jobs.length} jobs to whangarei_jobs.json`);
-}
-
-run();
+    console.log(`\nSaved ${jobs.length} jobs to ${city}_jobs.json`);
+  } catch (err) {
+    console.error("Error:", err);
+  }
+})();
