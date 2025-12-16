@@ -4,177 +4,288 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Interfaces
+// HTTP Headers                                                      
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+  Accept: "text/html,application/xhtml+xml",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+// Interfaces                                                         
+
+interface JobLink {
+  id: string;
+  title: string;
+  url: string;
+}
+
 interface JobData {
+  id: string | null;
   title: string | null;
   listingDate: string | null;
   company: string | null;
-  location: string | null;
-  employmentType: string | null;
+
+  locationCity?: string | null;
+  locationSuburb?: string | null;
+  locationRegion?: string | null;
+
+  workTypes?: string[] | null;
+  workStyle?: string | null;
+
   description: string;
   listedSalary: string | null;
-  hardSkills: string | null;
-  softSkills: string | null;
-  removalDate?: string | null;
+  hardSkills: string[] | null;
+  softSkills: string[] | null;
+
   RoleLevel?: string;
+  industry?: string;
+
+  orgId?: string | null;
 }
 
-// Role mapping
-const JOB_LEVEL_MAP: Record<number, string> = {
-  1: "Intern",
-  2: "Entry Level",
-  3: "Associate",
-  4: "Mid Level",
-  5: "Senior",
-  6: "Team Lead",
-  7: "General Manager",
-  8: "Executive/Director",
+
+// Utility Functions                                                  
+
+// Extract GTM job info
+function parseGtmData($: cheerio.CheerioAPI) {
+  const raw = $(".callout a[data-click-gtm-event]").attr("data-click-gtm-event");
+  if (!raw) return {};
+  try {
+    const decoded = raw.replace(/&quot;/g, '"');
+    const gtm = JSON.parse(decoded);
+    return {
+      gtmJobId: gtm.jobId || null,
+      title: gtm.jobTitle || null,
+      orgId: gtm.orgId || null,
+      orgName: gtm.orgName || null,
+      locationCity: gtm.locationCity || null,
+      locationSuburb: gtm.locationSuburb || null,
+      locationRegion: gtm.locationRegion || null,
+      workTypes: Array.isArray(gtm.workTypes) ? gtm.workTypes : null,
+      workStyle: gtm.workStyle || null,
+    };
+  } catch {
+    return {};
+  }
+}
+
+// Clean extra whitespace
+function cleanText(text?: string | null): string | null {
+  if (!text) return null;
+  return text.replace(/\s+/g, " ").trim();
+}
+
+// Get text from a selector
+function getText($: cheerio.CheerioAPI, selector: string): string | null {
+  const el = $(selector);
+  return el.length ? el.text() : null;
+}
+
+// Normalize salary string
+function normalizeSalary(text?: string | null): string | null {
+  if (!text) return null;
+  const parts = text.replace(/\s+/g, " ").trim().split(/(?=\$)/g);
+  return [...new Set(parts.map((p) => p.trim()))].join(" ");
+}
+
+// Extract salary from job description if not listed on page
+function extractSalaryFromDescription(text: string): string | null {
+  const regex =
+    /\$\d+(?:\.\d+)?(?:\s*-\s*\$\d+(?:\.\d+)?)?\s*(?:\/hr|per hour|per annum|pa)?/gi;
+  const matches = text.match(regex);
+  if (!matches) return null;
+  return normalizeSalary(matches.join(" "));
+}
+
+
+// Async Pool Function - controls concurrency     
+
+async function asyncPool<T, R>(
+  poolLimit: number,
+  array: T[],
+  iteratorFn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const ret: Promise<R>[] = [];
+  const executing: Promise<void>[] = [];
+
+  for (const [i, item] of array.entries()) {
+    const p = Promise.resolve().then(() => iteratorFn(item, i));
+    ret.push(p);
+
+    if (poolLimit <= array.length) {
+      const e: Promise<void> = p.then(() => void executing.splice(executing.indexOf(e), 1));
+      executing.push(e);
+      if (executing.length >= poolLimit) {
+        await Promise.race(executing);
+      }
+    }
+  }
+  return Promise.all(ret);
+}
+
+
+// Industry & RoleLevel Maps                                          
+
+const INDUSTRY_MAP: Record<number, string> = {
+  1: "Accounting", 2: "Administration & Office Support", 3: "Advertising, Arts & Media",
+  4: "Banking & Financial Services", 5: "Call Centre & Customer Service", 6: "CEO & General Management",
+  7: "Community Services & Development", 8: "Construction", 9: "Consulting & Strategy",
+  10: "Design & Architecture", 11: "Education & Training", 12: "Engineering",
+  13: "Farming, Animals & Conservation", 14: "Government & Defense", 15: "Healthcare & Medical",
+  16: "Hospitality & Tourism", 17: "Human Resources & Recruitment", 18: "Information & Communication Technology",
+  19: "Insurance & Superannuation", 20: "Legal", 21: "Manufacturing, Transport & Logistics",
+  22: "Marketing & Communications", 23: "Materials, Chemicals & Packaging", 24: "Mining, Resources & Energy",
+  25: "Real Estate & Property", 26: "Retail & Consumer Products", 27: "Sales",
+  28: "Science & Technology", 29: "Self Employment", 30: "Sport & Recreation",
+  31: "Trades & Services", 32: "Utilities",
 };
 
-// Helpers
-const getText = ($: any, selector: string): string | null =>
-  $?.(selector)?.first()?.text()?.trim() || null;
+const ROLE_LEVELS: Record<number, string> = {
+  1: "Intern", 2: "Entry Level", 3: "Associate", 4: "Mid Level",
+  5: "Senior", 6: "Team Lead", 7: "General Manager", 8: "Executive/Director",
+};
 
-const cleanText = (text: string | null | undefined): string | null =>
-  text?.replace(/\s+/g, " ").trim() || null;
 
-function extractSalary(text: string): string | null {
-  const keywords = [
-    "salary", "remuneration", "pay", "compensation",
-    "bonus", "allowance", "package", "wage", "reward",
-  ];
-  const sentences = text.split(/[\.\n]+/);
-  for (const sentence of sentences) {
-    if (keywords.some((k) => sentence.toLowerCase().includes(k))) return sentence.trim();
-  }
-  return null;
-}
+// Fetch Role Levels Map for all jobs                  
 
-// Pre-fetch RoleLevel mapping for a city
 async function getRoleLevelMap(city: string): Promise<Record<string, string>> {
   const cityNorm = city.toLowerCase().replace(/\s+/g, "-");
   const roleMap: Record<string, string> = {};
 
-  for (let level = 1; level <= 8; level++) {
-    let page = 1;
-    let hasMorePages = true;
+  console.log(`\nStarting role map extraction`);
 
-    while (hasMorePages) {
-      const url = `https://www.zeil.com/jobs/${cityNorm}/all?f_rl=${level}&page=${page}`;
-      const res = await axios.get(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          Accept: "text/html,application/xhtml+xml",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      });
+  const fetchPage = async (roleId: number, page: number) => {
+    const url = `https://www.zeil.com/jobs/${cityNorm}/all?f_rl=${roleId}&page=${page}`;
+    const res = await axios.get(url, { headers: HEADERS });
+    const $ = cheerio.load(res.data);
 
-      const $ = cheerio.load(res.data);
-      $(".job-item h3.title.v2").each((_, el) => {
-        const title = cleanText($(el).text())?.toLowerCase();
-        if (title) roleMap[title] = JOB_LEVEL_MAP[level] || "Not Found";
-      });
+    $("h3.title.tile.v2 a").each((_, el) => {
+      const href = $(el).attr("href");
+      const match = href?.match(/\/job\/([^?]+)/);
+      if (match?.[1]) roleMap[match[1]] = ROLE_LEVELS[roleId] || "Not Found";
+    });
 
-      const nextPage = $("div.paging a").attr("href");
-      if (nextPage) page++;
-      else hasMorePages = false;
-    }
+    return Boolean($("div.paging a").attr("href"));
+  };
+
+  for (const roleId of Object.keys(ROLE_LEVELS).map(Number)) {
+    let page = 1, hasMore = true;
+    while (hasMore) hasMore = await fetchPage(roleId, page++);
   }
 
+  console.log("\nRole map extraction completed.");
   return roleMap;
 }
 
-// Scrape individual job 
-async function getJobDetails(jobUrl: string, roleLevelMap: Record<string, string>): Promise<JobData> {
-  const res = await axios.get(jobUrl, {
-    headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-  });
 
-  const $ = cheerio.load(res.data);
-  const uls = $(".job-details ul.pills");
-  const locationRaw = cleanText(getText($, ".job-details div.splitbox > div p.value"));
+// Fetch Industry Map for all jobs                                     
 
-  const jobData: JobData = {
-    title: cleanText(getText($, "h2.v2")),
-    listingDate: cleanText(getText($, ".job-details ul.icon-list > li:nth-child(1)")),
-    company: cleanText(getText($, ".plain-text-link")),
-    location: locationRaw,
-    employmentType: cleanText(getText($, ".job-details ul.icon-list > li:nth-child(3)")),
-    description: cleanText(getText($, ".prose")) || "",
-    listedSalary: cleanText(getText($, ".job-details div.splitbox>div h4.salary")),
-    hardSkills: uls.eq(0).length ? cleanText(uls.eq(0).text()) : null,
-    softSkills: uls.eq(1).length ? cleanText(uls.eq(1).text()) : null,
+async function getIndustryMap(city: string): Promise<Record<string, string>> {
+  const cityNorm = city.toLowerCase().replace(/\s+/g, "-");
+  const industryMap: Record<string, string> = {};
+
+  console.log(`\nStarting industry map extraction`);
+
+  const fetchPage = async (industryId: number, page: number) => {
+    const url = `https://www.zeil.com/jobs/${cityNorm}/all?f_oi=${industryId}&page=${page}`;
+    const res = await axios.get(url, { headers: HEADERS });
+    const $ = cheerio.load(res.data);
+
+    $("h3.title.tile.v2 a").each((_, el) => {
+      const href = $(el).attr("href");
+      const match = href?.match(/\/job\/([^?]+)/);
+      if (match?.[1]) industryMap[match[1]] = INDUSTRY_MAP[industryId] || "Not Found";
+    });
+
+    return Boolean($("div.paging a").attr("href"));
   };
 
-  if (!jobData.listedSalary && jobData.description) {
-    jobData.listedSalary = extractSalary(jobData.description);
+  for (const industryId of Object.keys(INDUSTRY_MAP).map(Number)) {
+    let page = 1, hasMore = true;
+    while (hasMore) hasMore = await fetchPage(industryId, page++);
   }
+  console.log("\nIndustry map extraction completed.");
 
-  // Lookup RoleLevel from pre-fetched map
-  jobData.RoleLevel = roleLevelMap[jobData.title?.toLowerCase() || ""] || "Not Found";
-
-  return jobData;
+  return industryMap;
 }
 
-// Concurrency helper 
-async function asyncPool<T, R>(
-  poolLimit: number,
-  array: T[],
-  iteratorFn: (item: T) => Promise<R>
-): Promise<R[]> {
-  const ret: R[] = [];
-  const executing: Promise<any>[] = [];
 
-  for (const item of array) {
-    const p = Promise.resolve().then(() => iteratorFn(item));
-    ret.push(p as unknown as R);
+// Scrape Job Details                                                 
 
-    const e: Promise<any> = p.then(() => executing.splice(executing.indexOf(e), 1));
-    executing.push(e);
+async function getJobDetails(
+  job: JobLink,
+  roleLevelMap: Record<string, string>,
+  industryMap: Record<string, string>,
+  numericId: number
+): Promise<JobData> {
+  const res = await axios.get(job.url, { headers: HEADERS });
+  const $ = cheerio.load(res.data);
 
-    if (executing.length >= poolLimit) {
-      await Promise.race(executing);
-    }
-  }
+  const uls = $(".job-details ul.pills");
+  const gtm = parseGtmData($);
 
-  return Promise.all(ret);
+  const hardSkills = uls.eq(0).find("li").map((_, el) => $(el).text().trim()).get();
+  const softSkills = uls.eq(1).find("li").map((_, el) => $(el).text().trim()).get();
+
+  return {
+    id: gtm.gtmJobId || null,
+    title: gtm.title || null,
+    listingDate: cleanText(getText($, ".job-details ul.icon-list > li:nth-child(1)")),
+    company: gtm.orgName || null,
+    locationCity: gtm.locationCity || null,
+    locationRegion: gtm.locationRegion || null,
+    locationSuburb: gtm.locationSuburb || null,
+    workTypes: gtm.workTypes || null,
+    workStyle: gtm.workStyle || null,
+    description: cleanText(getText($, ".prose")) || "",
+    listedSalary: normalizeSalary(cleanText(getText($, "h4.salary"))) || extractSalaryFromDescription(cleanText(getText($, ".prose")) || ""),
+    hardSkills: hardSkills.length ? hardSkills : null,
+    softSkills: softSkills.length ? softSkills : null,
+    RoleLevel: roleLevelMap[job.id] || "Not Found",
+    industry: industryMap[job.id] || "Not Found",
+    orgId: gtm.orgId || null,
+  };
 }
 
-// Main Function
+
+// Main Function    
 (async () => {
   try {
-    const jobsPath = path.join(__dirname, "jobs.json");
-    const jobsRaw = await fs.readFile(jobsPath, "utf-8");
-    const jobsJson: { city: string; total: number; jobs: { title: string; url: string }[] } = JSON.parse(jobsRaw);
+    const city = "Hamilton";
+    const jobsPath = path.join(__dirname, `${city}_jobs.json`);
+    const jobsJson: { city: string; total: number; jobs: JobLink[] } = JSON.parse(await fs.readFile(jobsPath, "utf-8"));
 
-    console.log(`Pre-fetching RoleLevel map for city: ${jobsJson.city}...`);
     const roleLevelMap = await getRoleLevelMap(jobsJson.city);
-    console.log("RoleLevel map ready.\n");
+    const industryMap = await getIndustryMap(jobsJson.city);
 
-    console.log(`Scraping ${jobsJson.jobs.length} jobs concurrently...\n`);
-    const allJobDetails = await asyncPool(10, jobsJson.jobs, async (job) => {
+    console.log(`\nScraping ${jobsJson.jobs.length} jobs\n`);
+
+    const allJobDetails = await asyncPool(10, jobsJson.jobs, async (job, index) => {
       try {
-        return await getJobDetails(job.url, roleLevelMap);
-      } catch (err) {
+        return await getJobDetails(job, roleLevelMap, industryMap, index + 1);
+      } catch {
         console.error(`Failed: ${job.title}`);
         return null;
       }
     });
 
-    const finalJobDetails = allJobDetails.filter((j) => j !== null);
+    const finalJobDetails = allJobDetails.filter(Boolean) as JobData[];
 
-    const outputPath = path.join(__dirname, "job_details.json");
-    await fs.writeFile(outputPath, JSON.stringify(finalJobDetails, null, 2), "utf-8");
+    const missingRole = finalJobDetails.filter(j => !j.RoleLevel || j.RoleLevel === "Not Found");
+    const missingIndustry = finalJobDetails.filter(j => !j.industry || j.industry === "Not Found");
 
-    console.log(`\nSaved ${finalJobDetails.length} job details to job_details.json`);
+    if (missingRole.length) console.log(`Missing RoleLevel jobs: ${missingRole.length}`);
+    if (missingIndustry.length) console.log(`Missing Industry jobs: ${missingIndustry.length}`);
+
+    const outputPath = path.join(__dirname, `${city}_job_details.json`);
+    await fs.writeFile(outputPath, JSON.stringify({ city: jobsJson.city, totalJobs: finalJobDetails.length, jobs: finalJobDetails }, null, 2));
+
+    console.log(`\nSaved ${finalJobDetails.length} jobs to ${city}_job_details.json`);
   } catch (err) {
-    console.error("Error: ", err);
+    console.error("Error:", err);
   }
 })();
